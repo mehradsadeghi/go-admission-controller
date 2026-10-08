@@ -51,8 +51,8 @@ func (p Priority) String() string {
 type Request struct {
 	ID       int
 	Priority Priority
-	Deadline time.Duration
-	Process  func(context.Context, int, Priority, time.Duration) (Result, error)
+	Context  context.Context
+	Process  func(context.Context, int, Priority) (Result, error)
 }
 
 type Result struct {
@@ -99,7 +99,7 @@ func NewAdmissionController(ctx context.Context) *AdmissionController {
 	}
 
 	go func() {
-		<-ac.ctx.Done()
+		<-ctx.Done()
 		ac.Shutdown()
 	}()
 
@@ -145,6 +145,8 @@ func (a *AdmissionController) Submit(request Request) error {
 		default:
 			return errors.New("low priority queue is full")
 		}
+	default:
+		return errors.New("unknown priority")
 	}
 
 	return nil
@@ -197,9 +199,6 @@ func (a *AdmissionController) getFairQueue() <-chan Request {
 }
 
 func (a *AdmissionController) Start() error {
-	a.startedMu.Lock()
-	defer a.startedMu.Unlock()
-
 	if a.stopped.Load() {
 		return errors.New("admission controller already stopped")
 	}
@@ -219,24 +218,9 @@ func (a *AdmissionController) Start() error {
 							return
 						}
 
-						r, e := result.Process(a.ctx, result.ID, result.Priority, result.Deadline)
-						if e != nil {
-							select {
-							case a.errs <- e:
-							case <-a.ctx.Done():
-								return
-							}
+						if e := a.processRequest(result); e != nil {
+							a.NewError(e)
 							continue
-						}
-
-						if a.ctx.Err() != nil {
-							return
-						}
-
-						select {
-						case a.results <- r:
-						case <-a.ctx.Done():
-							return
 						}
 					case <-a.ctx.Done():
 						return
@@ -247,6 +231,16 @@ func (a *AdmissionController) Start() error {
 	})
 
 	return nil
+}
+
+func (a *AdmissionController) NewError(e error) {
+	select {
+	case a.errs <- e:
+	case <-a.ctx.Done():
+		return
+	default:
+		log.Fatal("errs channel is full", e)
+	}
 }
 
 func (a *AdmissionController) Shutdown() {
@@ -270,10 +264,7 @@ func (a *AdmissionController) Errors() <-chan error {
 	return a.errs
 }
 
-func process(ctx context.Context, id int, p Priority, d time.Duration) (Result, error) {
-	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(d))
-	defer cancel()
-
+func process(ctx context.Context, id int, p Priority) (Result, error) {
 	select {
 	case <-time.After(time.Millisecond * time.Duration(rand.IntN(10))):
 		// heavy computation
@@ -292,8 +283,34 @@ func process(ctx context.Context, id int, p Priority, d time.Duration) (Result, 
 	}, nil
 }
 
+func (a *AdmissionController) processRequest(req Request) error {
+	defer func() {
+		if r := recover(); r != nil {
+			select {
+			case a.errs <- fmt.Errorf("request %d panicked: %v", req.ID, r):
+			case <-a.ctx.Done():
+			}
+		}
+	}()
+
+	r, err := req.Process(req.Context, req.ID, req.Priority)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case a.results <- r:
+	case <-a.ctx.Done():
+	}
+
+	return nil
+}
+
 func main() {
-	a := NewAdmissionController(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a := NewAdmissionController(ctx)
 
 	go func() {
 		for v := range a.Results() {
@@ -309,37 +326,37 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	for i := range 10000 {
+	for i := range 100 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := a.Submit(Request{ID: i, Priority: HighPriority, Deadline: time.Second, Process: process}); err != nil {
+			if err := a.Submit(Request{ID: i, Priority: HighPriority, Context: ctx, Process: process}); err != nil {
 				fmt.Println(err)
 			}
 		}()
 	}
 
-	for i := range 10000 {
+	for i := range 100 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := a.Submit(Request{ID: i, Priority: MediumPriority, Deadline: time.Second, Process: process}); err != nil {
+			if err := a.Submit(Request{ID: i, Priority: MediumPriority, Context: ctx, Process: process}); err != nil {
 				fmt.Println(err)
 			}
 		}()
 	}
 
-	for i := range 10000 {
+	for i := range 100 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := a.Submit(Request{ID: i, Priority: LowPriority, Deadline: time.Second, Process: process}); err != nil {
+			if err := a.Submit(Request{ID: i, Priority: LowPriority, Context: ctx, Process: process}); err != nil {
 				fmt.Println(err)
 			}
 		}()
 	}
 
-	<-time.After(time.Second * 10)
+	<-time.After(time.Second)
 	wg.Wait()
 	a.Shutdown()
 }
