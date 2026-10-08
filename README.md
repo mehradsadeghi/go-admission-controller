@@ -243,215 +243,98 @@ const (
 )
 ```
 
-Consumers can access them through:
+# Priority Admission Controller
 
-```go
-a.Results()
-a.Errors()
+A small Go admission controller that processes requests concurrently using a fixed worker pool and three priority queues:
+
+* **High**
+* **Medium**
+* **Low**
+
+Each priority has its own bounded buffered queue. Requests are rejected when their corresponding queue is full.
+
+## Scheduling & Fairness
+
+The controller runs **8 workers** by default. Workers select requests according to a quota-based fairness policy:
+
+| Priority | Maximum consecutive selections per round |
+| -------- | ---------------------------------------: |
+| High     |                                      100 |
+| Medium   |                                       10 |
+| Low      |                                        5 |
+
+Within a scheduling round, higher-priority queues are preferred while their quota remains available. Once all available quotas are exhausted, the counters are reset and a new round begins.
+
+This provides **priority preference without allowing a continuously busy high-priority queue to permanently starve lower priorities**.
+
+For example, when all three queues remain non-empty, the scheduler can process up to 100 high-priority requests, 10 medium-priority requests, and 5 low-priority requests before starting another fairness round.
+
+The policy is **approximate rather than strict weighted scheduling** because workers independently select queues and multiple workers may make scheduling decisions concurrently.
+
+## Backpressure
+
+Each queue is bounded:
+
+```text
+High:   1000 requests
+Medium: 1000 requests
+Low:    1000 requests
 ```
 
-For example:
+`Submit` is non-blocking. It returns an error when the target queue is full rather than waiting for capacity.
 
-```go
-for result := range a.Results() {
-    fmt.Println(result)
-}
+This makes overload visible to callers and prevents producers from accumulating indefinitely inside the controller.
 
-for err := range a.Errors() {
-    fmt.Println(err)
-}
-```
+## Concurrency Trade-off
 
-### Result ordering
+The scheduler protects its fairness counters with a mutex. This keeps updates consistent across workers, but introduces contention because every worker must acquire the same lock before selecting a queue.
 
-Results are **not guaranteed to be ordered** by:
+The implementation deliberately favors **simple, predictable synchronization** over maximizing scheduler throughput. Since request processing happens outside this lock, the critical section remains small and the actual work can still execute concurrently across all workers.
 
-* request ID,
-* priority,
-* submission order,
-* or completion order across workers.
-
-The first result received is simply the next result successfully published by any worker.
+A related trade-off is the use of buffered queues: buffering absorbs short bursts and keeps workers busy, but it also allows requests to wait in memory and means queue length can temporarily hide overload from callers until a buffer fills.
 
 ## Shutdown
 
-Shutdown is coordinated through the controller's context.
+`Shutdown`:
 
-Calling:
+1. Cancels the controller context.
+2. Waits for all workers to exit.
+3. Marks the controller as stopped.
+4. Closes the results and error channels.
 
-```go
-a.Shutdown()
-```
+Calling `Shutdown` multiple times is safe.
 
-cancels the controller context and waits for all workers to exit.
-
-After workers have stopped:
-
-1. The controller is marked as stopped.
-2. The results channel is closed.
-3. The errors channel is closed.
-
-Consumers can therefore use `range` safely:
-
-```go
-for result := range a.Results() {
-    // ...
-}
-```
-
-Shutdown is protected by `sync.Once`, so repeated calls to `Shutdown` are safe.
-
-Likewise, `Start` is protected by `sync.Once`, preventing the worker pool from being started multiple times.
-
-## Cancellation
-
-The controller derives its internal context from the context supplied to:
-
-```go
-NewAdmissionController(ctx)
-```
-
-If the parent context is cancelled, the controller automatically shuts down.
-
-This gives the controller two shutdown paths:
-
-```text
-Explicit:
-    a.Shutdown()
-
-Context cancellation:
-    parent context cancelled
-             |
-             v
-       controller ctx
-             |
-             v
-        a.Shutdown()
-```
-
-## Concurrency Safety
-
-The implementation uses several synchronization mechanisms:
-
-### `sync.Once`
-
-`startOnce` ensures that the worker pool is started only once.
-
-`shutdownOnce` ensures that shutdown and channel closure happen only once.
-
-### `sync.WaitGroup`
-
-The worker pool uses a `WaitGroup` so shutdown can wait until every worker has exited.
-
-### `atomic.Bool`
-
-`stopped` provides a concurrency-safe indication that the controller has been stopped.
-
-### `sync.Mutex`
-
-`startedMu` protects the start/stop state transitions.
-
-`fairnessMu` protects the fairness counters so multiple workers cannot update scheduling state concurrently.
-
-## Fairness vs. Throughput Trade-off
-
-The fairness scheduler introduces synchronization overhead.
-
-Every worker calls `getFairQueue`, which takes `fairnessMu` before inspecting queue lengths and updating the fairness counters.
-
-This creates a small serialization point:
-
-```text
-Worker 1 ----\
-Worker 2 -----\
-Worker 3 ------> fairnessMu -> queue selection
-Worker 4 -----/
-...
-Worker 8 ----/
-```
-
-Without this lock, workers could select queues concurrently with less synchronization overhead, potentially improving throughput.
-
-However, without synchronization, the fairness counters could be updated inconsistently and the intended weighted scheduling policy would become unreliable.
-
-The implementation therefore trades a small amount of scheduler concurrency for **deterministic protection of the fairness accounting**.
-
-This trade-off is most relevant when individual `Process` calls are extremely short. If processing takes milliseconds or longer, the cost of the scheduler lock is likely to be much smaller relative to the actual work.
-
-## Queue Selection Behavior
-
-When the scheduler's quotas have not been exhausted, it checks the queues in priority order:
-
-1. High
-2. Medium
-3. Low
-
-provided the corresponding queue has pending work and has not exhausted its quota.
-
-Once all available quotas are exhausted, the counters are reset and a new round begins.
-
-If no queue currently contains work, the scheduler falls back to the High queue:
-
-```go
-return a.highPriorityQueue
-```
-
-The worker's `select` can then wait for work from that channel or for controller cancellation.
-
-## Capacity and Overload Characteristics
-
-The controller has a maximum of:
-
-```text
-1000 High
-1000 Medium
-1000 Low
-----------------
-3000 queued requests
-```
-
-in addition to requests currently being processed by the eight workers.
-
-This means the implementation has a bounded amount of queued work.
-
-If producers submit substantially faster than workers can process requests, queues will eventually fill and subsequent submissions will fail.
-
-This is preferable to allowing producer goroutines to block indefinitely or allowing memory usage to grow without bound.
+Requests and processing functions should honor their contexts so cancellation can propagate promptly.
 
 ## Example
 
-The example creates the controller:
-
 ```go
-a := NewAdmissionController(context.Background())
+ctx := context.Background()
+
+ac := NewAdmissionController(ctx)
+
+err := ac.Submit(Request{
+    ID:       1,
+    Priority: HighPriority,
+    Context:  ctx,
+    Process:  process,
+})
+if err != nil {
+    // Queue full or controller stopped.
+}
+
+ac.Shutdown()
 ```
 
-and submits 10,000 requests for each priority.
+## Configuration
 
-Because each queue is limited to 1,000 entries and submission is non-blocking, a significant number of submissions may be rejected when producers outrun the workers.
+The main scheduling parameters are defined as constants:
 
-The example therefore demonstrates both:
+```go
+WorkersCount        = 8
+MaxHighQueueFairCount   = 100
+MaxMediumQueueFairCount = 10
+MaxLowQueueFairCount    = 5
+```
 
-* **bounded admission**, and
-* **weighted priority scheduling**.
-
-Applications using this controller should normally treat a queue-full error as an expected overload signal rather than as an unexpected internal failure.
-
-## Design Summary
-
-The implementation intentionally combines four properties:
-
-| Property               | Mechanism                                       |
-| ---------------------- | ----------------------------------------------- |
-| Bounded resource usage | Fixed 8-worker pool + bounded queues            |
-| Priority               | Separate High/Medium/Low queues                 |
-| Fairness               | Weighted 100:10:5 scheduling                    |
-| Overload protection    | Non-blocking submission + queue capacity limits |
-
-The central design trade-off is:
-
-> **Higher priority improves scheduling preference, but does not completely exclude lower priorities.**
-
-This makes the controller appropriate for workloads where High-priority work should receive substantially more service while Medium- and Low-priority work must still make progress.
-
-It is not intended to provide strict priority ordering, strict latency guarantees, or guaranteed admission under overload.
+Adjust these values to change worker concurrency, queue capacity, and the balance between priority and fairness.
