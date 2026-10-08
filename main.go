@@ -217,6 +217,9 @@ func (a *AdmissionController) Start() error {
 						if a.ctx.Err() != nil {
 							return
 						}
+						if result.Context.Err() != nil {
+							return
+						}
 
 						if e := a.processRequest(result); e != nil {
 							a.NewError(e)
@@ -239,7 +242,7 @@ func (a *AdmissionController) NewError(e error) {
 	case <-a.ctx.Done():
 		return
 	default:
-		log.Fatal("errs channel is full", e)
+		log.Println("errs channel is full", e)
 	}
 }
 

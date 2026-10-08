@@ -193,20 +193,20 @@ Conversely, increasing the worker count can improve throughput for independent w
 
 Therefore, `WorkersCount` is a workload-dependent tuning parameter rather than an inherently optimal value.
 
-## Request Deadlines
+## Request Context
 
-Each request contains a `Deadline` duration:
+Each request contains a `Context`:
 
 ```go
 type Request struct {
     ID       int
     Priority Priority
-    Deadline time.Duration
+    Context  context.Context
     Process  func(context.Context, int, Priority, time.Duration) (Result, error)
 }
 ```
 
-The example `process` function creates a child context with a deadline:
+The example `process` function creates a child context:
 
 ```go
 ctx, cancel := context.WithDeadline(
